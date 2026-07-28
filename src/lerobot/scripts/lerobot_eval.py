@@ -170,6 +170,7 @@ def rollout(
     recording_repo_id: str | None = None,
     recording_private: bool = False,
     predicted_latents_callback: Callable[[PreTrainedPolicy], None] | None = None,
+    transition_callback: Callable[..., None] | None = None,
 ) -> dict:
     """Run a batched policy rollout once through a batch of environments.
 
@@ -202,6 +203,10 @@ def rollout(
         predicted_latents_callback: Optional callback invoked after every ``select_action`` with the policy
             itself. World-model policies (e.g. LingBot-VA) stash predicted video latents on
             ``policy.last_predicted_latents``; this lets the caller concatenate chunks and decode once.
+        transition_callback: Optional callback invoked after every environment step with the canonical
+            pre-action observation, the postprocessed action sent to ``env.step``, per-environment success
+            and done flags, and task strings. This permits streaming dataset collection without retaining
+            all rollout observations in memory.
     Returns:
         The dictionary described above.
     """
@@ -276,6 +281,13 @@ def rollout(
 
             # Apply environment-specific preprocessing (e.g., LiberoProcessorStep for LIBERO)
             observation = env_preprocessor(observation)
+            
+            if transition_callback is not None:
+                callback_observation = deepcopy(observation)
+                callback_tasks = list(observation["task"])
+            else:
+                callback_observation = None
+                callback_tasks = None
 
             observation = preprocessor(observation)
             with torch.inference_mode():
@@ -326,6 +338,19 @@ def rollout(
                 )
             else:
                 successes = [False] * env.num_envs
+                
+            if transition_callback is not None and callback_observation is not None:
+                callback_done = terminated | truncated
+                if step + 1 == max_steps:
+                    callback_done = np.ones_like(callback_done, dtype=bool)
+
+                transition_callback(
+                    observation=callback_observation,
+                    action=action_numpy,
+                    success=np.asarray(successes, dtype=bool),
+                    done=callback_done,
+                    tasks=callback_tasks,
+                )
 
             if recording_datasets is not None and raw_observation is not None:
                 prev_done = done.copy()
