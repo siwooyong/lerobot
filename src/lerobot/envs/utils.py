@@ -25,6 +25,7 @@ import gymnasium as gym
 import numpy as np
 import torch
 from huggingface_hub import hf_hub_download, snapshot_download
+from gymnasium.vector import AutoresetMode
 from torch import Tensor
 
 from lerobot.configs import FeatureType, PolicyFeature
@@ -212,7 +213,13 @@ class _LazyAsyncVectorEnv:
 
     def _ensure(self) -> None:
         if self._env is None:
-            self._env = gym.vector.AsyncVectorEnv(self._env_fns, context="forkserver", shared_memory=True)
+            # Every worker must be ready for the next batched action after a terminal step.
+            self._env = gym.vector.AsyncVectorEnv(
+                self._env_fns,
+                context="forkserver",
+                shared_memory=True,
+                autoreset_mode=AutoresetMode.SAME_STEP,
+            )
 
     @property
     def unwrapped(self):

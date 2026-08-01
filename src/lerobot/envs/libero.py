@@ -156,6 +156,7 @@ class LiberoEnv(gym.Env):
         self.num_steps_wait = num_steps_wait
         self.episode_index = episode_index
         self.episode_length = episode_length
+        self._elapsed_steps = 0
         # Load once and keep
         self._init_states = (
             get_task_init_states(task_suite, self.task_id, is_libero_plus=self.is_libero_plus)
@@ -347,6 +348,7 @@ class LiberoEnv(gym.Env):
                 robot.controller.use_delta = True
         else:
             raise ValueError(f"Invalid control mode: {self.control_mode}")
+        self._elapsed_steps = 0
         observation = self._format_raw_obs(raw_obs)
         info = {"is_success": False}
         return observation, info
@@ -360,9 +362,11 @@ class LiberoEnv(gym.Env):
                 f"but got shape {action.shape} with ndim={action.ndim}"
             )
         raw_obs, reward, done, info = self._env.step(action)
+        self._elapsed_steps += 1
 
         is_success = self._env.check_success()
         terminated = done or is_success
+        truncated = not terminated and self._elapsed_steps >= self._max_episode_steps
         info.update(
             {
                 "task": self.task,
@@ -372,9 +376,8 @@ class LiberoEnv(gym.Env):
             }
         )
         observation = self._format_raw_obs(raw_obs)
-        if terminated:
-            self.reset()
-        truncated = False
+        # Gymnasium's vector wrapper owns autoreset; resetting here would make
+        # its terminal-state bookkeeping inconsistent across worker processes.
         return observation, reward, terminated, truncated, info
 
     def close(self):

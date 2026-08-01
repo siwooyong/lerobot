@@ -886,8 +886,9 @@ class VLAFlowMatching(nn.Module):
         past_key_values,
         x_t,
         timestep,
+        return_suffix_out: bool = False,
     ):
-        """Apply one denoising step of the noise `x_t` at a given timestep."""
+        """Apply one denoising step and optionally return the action-expert hidden state."""
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, timestep)
 
         suffix_len = suffix_pad_masks.shape[1]
@@ -913,4 +914,4 @@ class VLAFlowMatching(nn.Module):
         suffix_out = suffix_out[:, -self.config.chunk_size :]
         suffix_out = suffix_out.to(dtype=torch.float32)
         v_t = self.action_out_proj(suffix_out)
-        return v_t
+        return (v_t, suffix_out) if return_suffix_out else v_t
