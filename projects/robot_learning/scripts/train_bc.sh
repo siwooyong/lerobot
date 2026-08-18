@@ -7,7 +7,7 @@ export LEROBOT_LANCE_DECODE_DEVICE=cpu
 accelerate launch \
   --num_processes=1 \
   --mixed_precision=bf16 \
-  train_smolvla_lance.py \
+  train_bc.py \
   --policy.type=smolvla \
   --policy.vlm_model_name=HuggingFaceTB/SmolVLM2-256M-Video-Instruct \
   --policy.load_vlm_weights=true \
