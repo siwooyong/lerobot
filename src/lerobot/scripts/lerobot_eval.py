@@ -316,7 +316,7 @@ def rollout(
                 if isinstance(final_info, dict):
                     is_success = final_info.get("is_success", [False] * env.num_envs)
                     successes = (
-                        is_success.tolist()
+                        [bool(success) if success is not None else False for success in is_success.tolist()]
                         if hasattr(is_success, "tolist")
                         else [bool(is_success)] * env.num_envs
                     )
@@ -530,6 +530,17 @@ def eval_policy(
     # we dont want progress bar when we use slurm, since it clutters the logs
     progbar = trange(n_batches, desc="Stepping through eval batches", disable=inside_slurm())
     for batch_ix in progbar:
+        # LIBERO assigns one fixed initial-state index to each worker. Reassert the
+        # index for every evaluation batch so vector-env auto-resets cannot shift
+        # the next batch away from the intended contiguous evaluation states.
+        try:
+            env.get_attr("init_state_id")
+        except (AttributeError, NotImplementedError):
+            pass
+        else:
+            start_index = batch_ix * env.num_envs
+            env.set_attr("init_state_id", list(range(start_index, start_index + env.num_envs)))
+
         # Cache frames for rendering videos. Each item will be (b, h, w, c), and the list indexes the rollout
         # step.
         if max_episodes_rendered > 0:

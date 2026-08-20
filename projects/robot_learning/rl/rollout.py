@@ -1,16 +1,41 @@
 """Suite-parallel LIBERO environments and PPO rollout storage."""
 
+import random
 from dataclasses import dataclass
 from functools import partial
 
 import torch
 import torch.nn.functional as F
 from gymnasium.vector import AsyncVectorEnv, AutoresetMode
-from lerobot.envs.libero import TASK_SUITE_MAX_STEPS, LiberoEnv, _get_suite
+from lerobot.envs.libero import TASK_SUITE_MAX_STEPS, LiberoEnv, _get_suite, get_task_init_states
 from torch import Tensor
 
 
 Task = tuple[str, int]
+IMAGE_PREFIX = "observation.images."
+
+
+def pack_images(batch: dict[str, Tensor]) -> dict[str, Tensor]:
+    """Store model images as native uint8 pixels; leave every other input unchanged."""
+    return {
+        key: value.mul(255).round().clamp_(0, 255).to(torch.uint8)
+        if key.startswith(IMAGE_PREFIX)
+        else value
+        for key, value in batch.items()
+    }
+
+
+def unpack_images(batch: dict[str, Tensor]) -> dict[str, Tensor]:
+    """Restore uint8 rollout images to SmolVLA's float32 [0, 1] input domain."""
+    return {
+        key: value.to(torch.float32).div(255) if key.startswith(IMAGE_PREFIX) else value
+        for key, value in batch.items()
+    }
+
+
+def canonicalize_images(batch: dict[str, Tensor]) -> dict[str, Tensor]:
+    """Use exactly the same image representation during rollout and PPO replay."""
+    return unpack_images(pack_images(batch))
 
 
 def suite_tasks(suite: str) -> list[Task]:
@@ -64,13 +89,13 @@ class SuiteSchedule:
         return selected
 
 
-def _env(task: Task, worker: int, workers_per_task: int, **kwargs):
+def _env(task: Task, episode_index: int, workers_per_task: int, **kwargs):
     suite, task_id = task
     return LiberoEnv(
         task_suite=_get_suite(suite),
         task_suite_name=suite,
         task_id=task_id,
-        episode_index=worker,
+        episode_index=episode_index,
         n_envs=workers_per_task,
         **kwargs,
     )
@@ -80,11 +105,26 @@ def make_env(tasks: list[Task], workers: list[int], **kwargs):
     """Create one heterogeneous vector environment for a single LIBERO suite."""
     if len(tasks) != len(workers) or any(count < 1 for count in workers):
         raise ValueError("Each task needs one or more workers.")
-    fns = [
-        partial(_env, task, worker, count, **kwargs)
-        for task, count in zip(tasks, workers)
-        for worker in range(count)
-    ]
+
+    fns = []
+    for task, count in zip(tasks, workers):
+        suite, task_id = task
+        if kwargs.get("init_states", True):
+            max_init_states = len(
+                get_task_init_states(
+                    _get_suite(suite),
+                    task_id,
+                    is_libero_plus=kwargs.get("is_libero_plus", False),
+                )
+            )
+            episode_indices = [random.randrange(max_init_states) for _ in range(count)]
+        else:
+            episode_indices = list(range(count))
+
+        fns.extend(
+            partial(_env, task, episode_index, count, **kwargs)
+            for episode_index in episode_indices
+        )
     return AsyncVectorEnv(
         fns,
         context="forkserver",

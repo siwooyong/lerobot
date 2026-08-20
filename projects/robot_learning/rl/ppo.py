@@ -29,14 +29,9 @@ def gae(rewards: Tensor, dones: Tensor, values: Tensor, worker_ids: Tensor, boot
     return advantage, advantage + values
 
 
-def normalize_advantage(advantage: Tensor, task_ids: Tensor) -> Tensor:
-    """Normalize advantages independently for each task in a PPO rollout batch."""
-    normalized = torch.empty_like(advantage)
-    for task_id in task_ids.unique().tolist():
-        indices = task_ids == task_id
-        task_advantage = advantage[indices]
-        normalized[indices] = (task_advantage - task_advantage.mean()) / task_advantage.std(unbiased=False).clamp_min(1e-4)
-    return normalized
+def normalize_advantage(advantage: Tensor) -> Tensor:
+    """Normalize advantages across the complete PPO rollout batch."""
+    return (advantage - advantage.mean()) / (advantage.std() + 1e-5)
 
 
 def _huber(error: Tensor, delta: float) -> Tensor:

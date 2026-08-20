@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+cd "$root"
+
 # CPU JPEG decode avoids creating one CUDA context per DataLoader worker.
 export LEROBOT_LANCE_DECODE_DEVICE=cpu
 
 accelerate launch \
   --num_processes=1 \
   --mixed_precision=bf16 \
-  train_bc.py \
+  "$root/projects/robot_learning/scripts/train_bc.py" \
   --policy.type=smolvla \
   --policy.vlm_model_name=HuggingFaceTB/SmolVLM2-256M-Video-Instruct \
   --policy.load_vlm_weights=true \
@@ -29,6 +32,6 @@ accelerate launch \
   --save_freq=10000 \
   --env_eval_freq=0 \
   --seed=1000 \
-  --output_dir=outputs/baseline[lr_decay_100k] \
-  --job_name=baseline[lr_decay_100k] \
+  --output_dir=outputs/baseline_100k \
+  --job_name=baseline_100k \
   --wandb.enable=true
