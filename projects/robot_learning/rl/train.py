@@ -1,18 +1,21 @@
 """Single-GPU, suite-parallel Flow-Noise PPO for LIBERO."""
 
 import argparse
+import ctypes
+import gc
 from contextlib import nullcontext
 from pathlib import Path
 
 import torch
 from tqdm import tqdm
+from transformers.optimization import get_cosine_with_min_lr_schedule_with_warmup
 from lerobot.envs import make_env_pre_post_processors, preprocess_observation
 from lerobot.envs.configs import LiberoEnv
 from lerobot.policies import make_pre_post_processors
 from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
 from lerobot.utils.constants import ACTION
 
-from .actor import FlowNoiseActor, executed_log_prob, trainable_parameters
+from .actor import FlowNoiseActor, executed_log_prob, executed_mean, trainable_parameters
 from .critic import ValueCritic
 from .ppo import gae, loss, normalize_advantage
 from .rollout import (
@@ -21,11 +24,13 @@ from .rollout import (
     TaskResult,
     Transition,
     active_tasks,
-    horizon,
+    canonicalize_images,
     make_env,
     merge,
+    pack_images,
     suite_tasks,
     task_groups,
+    unpack_images,
     worker_counts,
 )
 
@@ -100,14 +105,13 @@ def collect_group(suite, tasks, workers, group_offset, worker_offset, actor, cri
     for worker_count in workers:
         offsets.append(offsets[-1] + worker_count)
     count = offsets[-1]
-    if horizon(suite) % cfg.action_steps:
-        raise ValueError("The suite horizon must be divisible by action_steps for fixed-chunk rollout.")
     env = make_env(
         tasks,
         workers,
         obs_type="pixels_agent_pos",
         observation_height=256,
         observation_width=256,
+        episode_length=cfg.max_episode_steps,
     )
     buffer, results = RolloutBuffer(), [TaskResult(task) for task in tasks]
 
@@ -118,17 +122,26 @@ def collect_group(suite, tasks, workers, group_offset, worker_offset, actor, cri
         finished = torch.zeros(count, dtype=torch.bool)
         previous_step_reward = torch.zeros(count)
 
-        while elapsed < horizon(suite):
-            data = batch(observation, language, pre, env_pre, device)
-            with torch.no_grad(), amp(cfg):
+        while elapsed < cfg.chunks_per_worker * cfg.action_steps:
+            # Make the rollout policy consume the same decoded uint8 images
+            # that PPO will later replay from the rollout buffer.
+            data = canonicalize_images(batch(observation, language, pre, env_pre, device))
+            with amp(cfg):
                 sample = actor(data)
+            sample = sample._replace(
+                actions=sample.actions.detach(),
+                path=sample.path.detach(),
+                log_prob=sample.log_prob.detach(),
+                noise_std=sample.noise_std.detach(),
+            )
+            with torch.no_grad(), amp(cfg):
                 old_values = critic(sample.critic_features).float()
 
             reward = torch.zeros(count)
             done = torch.zeros(count, dtype=torch.bool)
             steps = torch.full((count,), cfg.action_steps, dtype=torch.long)
 
-            for action in sample.actions.unbind(1):
+            for action_index, action in enumerate(sample.actions.unbind(1)):
                 command = to_env_action(action, post, env_post).cpu().numpy()
                 observation, step_reward, terminated, truncated, info = env.step(command)
 
@@ -146,6 +159,7 @@ def collect_group(suite, tasks, workers, group_offset, worker_offset, actor, cri
                 elapsed += 1
 
                 completed = terminal & ~finished
+                steps[completed] = action_index + 1
                 success = successes(info, count) & completed
                 for task_id, result in enumerate(results):
                     indices = slice(offsets[task_id], offsets[task_id + 1])
@@ -168,7 +182,7 @@ def collect_group(suite, tasks, workers, group_offset, worker_offset, actor, cri
                         Transition(
                             group,
                             worker_offset + index,
-                            {key: value[index : index + 1].cpu() for key, value in data.items()},
+                            pack_images({key: value[index : index + 1].cpu() for key, value in data.items()}),
                             sample.path[index : index + 1].cpu(),
                             executed_log_prob(sample.log_prob[index : index + 1], steps[index : index + 1]).cpu(),
                             old_values[index : index + 1].cpu(),
@@ -181,7 +195,7 @@ def collect_group(suite, tasks, workers, group_offset, worker_offset, actor, cri
             progress.update(count)
 
         with torch.no_grad(), amp(cfg):
-            bootstrap_sample = actor(batch(observation, language, pre, env_pre, device))
+            bootstrap_sample = actor(canonicalize_images(batch(observation, language, pre, env_pre, device)))
             bootstrap_values = critic(bootstrap_sample.critic_features).float().cpu()
 
         for index in range(count):
@@ -200,7 +214,7 @@ def collect_suite(suite, group_offset, worker_offset, actor, critic, pre, env_pr
         raise ValueError(f"{suite} has no active workers.")
 
     buffer, results, worker_count = RolloutBuffer(), [], 0
-    progress = tqdm(total=sum(workers) * horizon(suite) // cfg.action_steps, desc="collecting", unit="chunk")
+    progress = tqdm(total=sum(workers) * cfg.chunks_per_worker, desc="collecting", unit="chunk")
     try:
         for task_group, worker_group in task_groups(tasks, workers, cfg.max_concurrent_envs):
             rollout, group_results, count = collect_group(
@@ -236,12 +250,21 @@ def update(actor, critic, actor_opt, critic_opt, buffer, cfg, device):
     advantage, target = gae(
         data["reward"], data["done"], values, data["worker"], bootstrap, cfg.gamma, cfg.gae_lambda
     )
-    advantage = normalize_advantage(advantage, data["task"])
+    with torch.no_grad():
+        target_variance = target.var(unbiased=False)
+        explained_variance = torch.tensor(float("nan"), device=device)
+        if target_variance.item() > 1e-8:
+            explained_variance = 1.0 - (target - values).var(unbiased=False) / target_variance
+    advantage = normalize_advantage(advantage)
+    sample_count = len(buffer.items) // cfg.minibatch * cfg.minibatch
 
     losses = torch.zeros(3, device=device)
     clipped = torch.zeros(int(data["task"].max()) + 1, device=device)
     samples = torch.zeros_like(clipped)
     loss_count = 0
+    actor_grad_norm_sum = torch.zeros((), device=device)
+    critic_grad_norm_sum = torch.zeros((), device=device)
+    optimizer_step_count = 0
 
     epoch_stats = []
     progress = tqdm(total=cfg.ppo_epochs, desc="updating", unit="epoch")
@@ -249,7 +272,6 @@ def update(actor, critic, actor_opt, critic_opt, buffer, cfg, device):
         for _ in range(cfg.ppo_epochs):
             actor_opt.zero_grad()
             critic_opt.zero_grad()
-            sample_count = len(buffer.items) // cfg.minibatch * cfg.minibatch
 
             epoch_logratios = []
             epoch_clipped = torch.zeros((), device=device)
@@ -258,7 +280,7 @@ def update(actor, critic, actor_opt, critic_opt, buffer, cfg, device):
                 torch.randperm(len(buffer.items), device=device)[:sample_count].split(cfg.minibatch)
             ):
                 batches = [buffer.items[index].batch for index in indices.cpu().tolist()]
-                minibatch = {key: value.to(device) for key, value in merge(batches).items()}
+                minibatch = unpack_images({key: value.to(device) for key, value in merge(batches).items()})
                 old_log_prob = data["old_log_prob"][indices].float()
                 with amp(cfg):
                     new_log_prob, entropy, critic_features = actor(minibatch, data["path"][indices], return_entropy=True)
@@ -266,6 +288,7 @@ def update(actor, critic, actor_opt, critic_opt, buffer, cfg, device):
                         new_log_prob,
                         data["steps"][indices],
                     ).float()
+                    entropy = executed_mean(entropy, data["steps"][indices]).float()
                     terms = loss(
                         new_log_prob,
                         old_log_prob,
@@ -293,8 +316,11 @@ def update(actor, critic, actor_opt, critic_opt, buffer, cfg, device):
 
                 ((terms.policy + terms.value) / cfg.gradient_accumulation_steps).backward()
                 if (batch_index + 1) % cfg.gradient_accumulation_steps == 0:
-                    torch.nn.utils.clip_grad_norm_(actor_opt.param_groups[0]["params"], cfg.max_grad_norm)
-                    torch.nn.utils.clip_grad_norm_(critic_opt.param_groups[0]["params"], cfg.max_grad_norm)
+                    actor_grad_norm = torch.nn.utils.clip_grad_norm_(actor_opt.param_groups[0]["params"], cfg.max_grad_norm)
+                    critic_grad_norm = torch.nn.utils.clip_grad_norm_(critic_opt.param_groups[0]["params"], cfg.max_grad_norm)
+                    actor_grad_norm_sum += actor_grad_norm.detach()
+                    critic_grad_norm_sum += critic_grad_norm.detach()
+                    optimizer_step_count += 1
                     actor_opt.step()
                     critic_opt.step()
                     actor_opt.zero_grad()
@@ -310,9 +336,13 @@ def update(actor, critic, actor_opt, critic_opt, buffer, cfg, device):
 
     clips = [(int(count), int(total)) for count, total in zip(clipped.tolist(), samples.tolist())]
     task_noise_stds = [data["noise_std"][data["task"] == task].mean().item() for task in range(len(clipped))]
+    metrics = dict(zip(("actor_loss", "critic_loss", "entropy"), (losses / loss_count).tolist()))
+    metrics["explained_variance"] = explained_variance.item()
+    metrics["actor_grad_norm"] = (actor_grad_norm_sum / optimizer_step_count).item() if optimizer_step_count else float("nan")
+    metrics["critic_grad_norm"] = (critic_grad_norm_sum / optimizer_step_count).item() if optimizer_step_count else float("nan")
     return (
         data,
-        dict(zip(("actor_loss", "critic_loss", "entropy"), (losses / loss_count).tolist())),
+        metrics,
         clips,
         task_noise_stds,
         epoch_stats,
@@ -322,7 +352,13 @@ def update(actor, critic, actor_opt, critic_opt, buffer, cfg, device):
 def main(cfg) -> None:
     cfg.output.mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda")
-    policy = SmolVLAPolicy.from_pretrained(cfg.checkpoint).to(device).eval()
+    resume_state = None
+    checkpoint = cfg.checkpoint
+    if cfg.resume is not None:
+        checkpoint = cfg.resume / "pretrained_model"
+        resume_state = torch.load(cfg.resume / "rl_state.pt", map_location=device, weights_only=True)
+
+    policy = SmolVLAPolicy.from_pretrained(checkpoint).to(device).eval()
     policy.config.num_steps = cfg.denoise_steps
     policy.config.train_expert_only = cfg.train_expert_only
     policy.config.train_state_proj = cfg.train_state_proj
@@ -332,15 +368,39 @@ def main(cfg) -> None:
 
     actor = FlowNoiseActor(policy, cfg.action_steps).to(device)
     critic = ValueCritic(policy.model.vlm_with_expert.config.text_config.hidden_size).to(device)
+    start_update = 0
+    if resume_state is not None:
+        actor.noise.load_state_dict(resume_state["noise"])
+        critic.load_state_dict(resume_state["critic"])
+        start_update = int(resume_state["update"])
     if cfg.compile_model:
         compile_actor(actor)
 
     betas = (cfg.adam_beta1, cfg.adam_beta2)
     actor_opt = torch.optim.AdamW(trainable_parameters(actor), lr=cfg.actor_lr, betas=betas)
     critic_opt = torch.optim.AdamW(critic.parameters(), lr=cfg.critic_lr, betas=betas)
+    if resume_state is not None:
+        actor_opt.load_state_dict(resume_state["actor_optimizer"])
+        critic_opt.load_state_dict(resume_state["critic_optimizer"])
+    actor_scheduler = critic_scheduler = None
+    if cfg.lr_scheduler == "cosine":
+        actor_scheduler = get_cosine_with_min_lr_schedule_with_warmup(
+            optimizer=actor_opt,
+            num_warmup_steps=0,
+            num_training_steps=cfg.total_training_steps,
+            num_cycles=0.5,
+            min_lr_rate=0.1,
+        )
+        critic_scheduler = get_cosine_with_min_lr_schedule_with_warmup(
+            optimizer=critic_opt,
+            num_warmup_steps=0,
+            num_training_steps=cfg.total_training_steps,
+            num_cycles=0.5,
+            min_lr_rate=0.1,
+        )
     pre, post = make_pre_post_processors(
         policy.config,
-        pretrained_path=str(cfg.checkpoint),
+        pretrained_path=str(checkpoint),
         preprocessor_overrides={
             "device_processor": {"device": "cuda"},
             "tokenizer_processor": {
@@ -353,29 +413,40 @@ def main(cfg) -> None:
     schedule = SuiteSchedule(cfg.suites, cfg.suites_per_update)
 
     with (cfg.output / "log.txt").open("a", encoding="utf-8") as log_file:
-        for update_index in range(cfg.updates):
+        for update_index in range(start_update, cfg.updates):
             buffer, results, group_offset, worker_offset = RolloutBuffer(), [], 0, 0
             for suite in schedule.next():
                 rollout, suite_results, worker_count = collect_suite(
                     suite, group_offset, worker_offset, actor, critic, pre, env_pre, post, env_post, cfg, device
                 )
                 buffer.extend(rollout)
+                worker_offset += worker_count
                 results.extend(suite_results)
                 group_offset += len(suite_results)
-                worker_offset += worker_count
 
             data, losses, clips, task_noise_stds, epoch_stats = update(
                 actor, critic, actor_opt, critic_opt, buffer, cfg, device
             )
+            del buffer, rollout
+            gc.collect()
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+            actor_lr = actor_opt.param_groups[0]["lr"]
+            critic_lr = critic_opt.param_groups[0]["lr"]
             successes_total = sum(result.successes for result in results)
             episodes_total = sum(result.episodes for result in results)
             log(
                 f"update={update_index + 1} | reward={data['reward'].mean().item():.3f} | "
                 f"success_rate={successes_total}/{episodes_total} | "
                 f"actor_loss={losses['actor_loss']:.4f} | critic_loss={losses['critic_loss']:.4f} | "
-                f"entropy={losses['entropy']:.4f}",
+                f"entropy={losses['entropy']:.4f} | explained_variance={losses['explained_variance']:.4f} | "
+                f"actor_lr={actor_lr:.3e} | critic_lr={critic_lr:.3e} | "
+                f"actor_grad_norm={losses['actor_grad_norm']:.3f} | "
+                f"critic_grad_norm={losses['critic_grad_norm']:.3f}",
                 log_file,
             )
+            if actor_scheduler is not None:
+                actor_scheduler.step()
+                critic_scheduler.step()
             for epoch_index, stats in enumerate(epoch_stats, start=1):
                 log(
                     f"  ppo_epoch={epoch_index} | approx_kl={stats['approx_kl']:.6f} "
@@ -396,20 +467,31 @@ def main(cfg) -> None:
                 pre.save_pretrained(directory)
                 post.save_pretrained(directory)
                 torch.save(
-                    {"noise": actor.noise.state_dict(), "critic": critic.state_dict(), "update": update_index + 1},
+                    {
+                        "noise": actor.noise.state_dict(),
+                        "critic": critic.state_dict(),
+                        "actor_optimizer": actor_opt.state_dict(),
+                        "critic_optimizer": critic_opt.state_dict(),
+                        "update": update_index + 1,
+                    },
                     directory.parent / "rl_state.pt",
                 )
 
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--checkpoint", type=Path)
+    parser.add_argument("--resume", type=Path, help="Update directory containing pretrained_model and rl_state.pt.")
     parser.add_argument("--output", type=Path, default=Path("outputs/flow_noise"))
     parser.add_argument("--suites", nargs="+", choices=SUITES, default=["libero_spatial"])
     parser.add_argument("--suites-per-update", type=int, default=1)
     parser.add_argument("--workers", action="extend", type=worker_spec, nargs="+", metavar="SCOPE=COUNT")
     parser.add_argument("--max-concurrent-envs", type=positive, default=24)
     parser.add_argument("--updates", type=int, default=100)
+    parser.add_argument("--total-training-steps", type=positive, default=100)
+    parser.add_argument("--lr-scheduler", choices=("constant", "cosine"), default="cosine")
+    parser.add_argument("--chunks-per-worker", type=positive, default=52)
+    parser.add_argument("--max-episode-steps", type=positive)
     parser.add_argument("--action-steps", type=int, default=10)
     parser.add_argument("--denoise-steps", type=int, default=5)
     parser.add_argument("--pad-language-to", choices=("longest", "max_length"), default="max_length")
@@ -434,6 +516,8 @@ def parse_args(argv=None):
     parser.add_argument("--train-state-proj", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--freeze-vision-encoder", action=argparse.BooleanOptionalAction, default=True)
     cfg = parser.parse_args(argv)
+    if (cfg.checkpoint is None) == (cfg.resume is None):
+        parser.error("Specify exactly one of --checkpoint or --resume.")
     cfg.workers = {"default": 2, **dict(cfg.workers or [])}
     return cfg
 

@@ -41,6 +41,14 @@ def executed_log_prob(log_prob: Tensor, steps: Tensor) -> Tensor:
     return (log_prob * mask).sum(1)
 
 
+def executed_mean(values: Tensor, steps: Tensor) -> Tensor:
+    """Average per-action values over the valid prefix of an action chunk."""
+    steps = steps.to(values.device)
+    mask = torch.arange(values.shape[1], device=values.device) < steps[:, None]
+    denominator = steps.clamp_min(1).to(values.dtype)
+    return (values * mask).sum(1) / denominator
+
+
 class FlowNoiseHead(nn.Module):
     """RLinf Flow-Noise log-variance head, evaluated entirely in float32."""
 
@@ -77,7 +85,7 @@ class FlowNoiseActor(nn.Module):
         self.action_dim = policy.config.action_feature.shape[0]
         self.latent_dim = policy.config.max_action_dim
         self.num_steps = policy.config.num_steps
-        self.noise = FlowNoiseHead(self.model.vlm_with_expert.expert_hidden_size, self.action_dim)
+        self.noise = FlowNoiseHead(self.model.vlm_with_expert.expert_hidden_size, self.latent_dim)
         configure_smolvla_trainability(policy)
 
     def _prefix(self, batch: dict[str, Tensor]) -> tuple[Tensor, object, Tensor]:
@@ -107,9 +115,9 @@ class FlowNoiseActor(nn.Module):
 
     @staticmethod
     def _aggregate_entropy(stds: Tensor) -> Tensor:
-        """RLinf-style mean Gaussian entropy over the Flow-Noise chain."""
+        """RLinf-style mean Gaussian entropy per action over the Flow-Noise chain."""
         entropy = 0.5 * torch.log(2 * math.pi * math.e * stds.float().square())
-        return entropy.mean(dim=(1, 2, 3))
+        return entropy.mean(dim=(1, 3))
 
     def _step(self, x: Tensor, masks: Tensor, cache: object, time: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         velocity, suffix_out = self.model.denoise_step(
@@ -133,11 +141,17 @@ class FlowNoiseActor(nn.Module):
         for step in range(self.num_steps):
             time = torch.full((len(context),), 1 - step / self.num_steps, device=context.device)
             mean, std, _ = self._step(x, masks, cache, time)
-            noise_std += std[:, : self.action_steps].mean(dim=(1, 2))
-            delta = std[:, : self.action_steps] * torch.randn_like(std[:, : self.action_steps])
-            x = mean.clone()
-            x[:, : self.action_steps, : self.action_dim] += delta.to(x.dtype)
-            log_prob += self._log_prob(delta, std[:, : self.action_steps])
+            noise_std += std[:, : self.action_steps, : self.action_dim].mean(dim=(1, 2))
+            delta = std * torch.randn_like(std)
+            x = mean + delta.to(mean.dtype)
+            # Match PPO replay: evaluate the sampled transition as
+            # log N(x_next | mean, std), rather than through the separately
+            # retained random delta.
+            log_prob += self._log_prob(
+                x[:, : self.action_steps, : self.action_dim].float()
+                - mean[:, : self.action_steps, : self.action_dim].float(),
+                std[:, : self.action_steps, : self.action_dim],
+            )
             path.append(x)
         return FlowSample(
             x[:, : self.action_steps, : self.action_dim],
@@ -164,8 +178,8 @@ class FlowNoiseActor(nn.Module):
                 path[:, step + 1, : self.action_steps, : self.action_dim].float()
                 - mean[:, : self.action_steps, : self.action_dim].float()
             )
-            total += self._log_prob(delta, std[:, : self.action_steps])
-            stds.append(std[:, : self.action_steps])
+            total += self._log_prob(delta, std[:, : self.action_steps, : self.action_dim])
+            stds.append(std[:, : self.action_steps, : self.action_dim])
         total = total / (self.num_steps + 1)
         if return_entropy:
             return (

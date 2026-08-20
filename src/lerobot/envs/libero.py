@@ -261,6 +261,7 @@ class LiberoEnv(gym.Env):
             bddl_file_name=self._task_bddl_file,
             camera_heights=self.observation_height,
             camera_widths=self.observation_width,
+            hard_reset=False,
         )
         env.reset()
         self._env = env
