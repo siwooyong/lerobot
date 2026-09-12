@@ -5,9 +5,10 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "$repo_root"
 
 accelerate launch \
-  --num_processes=1 \
+  --num_processes=4 \
   --mixed_precision=bf16 \
-  --module projects.new_project.scripts.train_bc \
+  --module lerobot.scripts.lerobot_train \
+  --accelerator.gradient_accumulation.steps=1 \
   --policy.type=smolvla \
   --policy.vlm_model_name=HuggingFaceTB/SmolVLM2-256M-Video-Instruct \
   --policy.load_vlm_weights=true \
@@ -17,25 +18,31 @@ accelerate launch \
   --policy.train_state_proj=true \
   --policy.freeze_vision_encoder=true \
   --policy.compile_model=true \
+  --policy.compile_mode=max-autotune-no-cudagraphs \
   --policy.push_to_hub=false \
   --policy.n_obs_steps=1 \
   --policy.chunk_size=16 \
   --policy.n_action_steps=8 \
-  --policy.scheduler_warmup_steps=100 \
-  --policy.scheduler_decay_steps=100000 \
-  --policy.scheduler_decay_lr=2.5e-6 \
-  --dataset.repo_id=robocasa/pretrain_human \
-  --dataset.root="$repo_root/projects/new_project/robocasa/datasets" \
+  --policy.optimizer_lr=1e-4 \
+  --policy.optimizer_betas='[0.9, 0.999]' \
+  --policy.optimizer_weight_decay=1e-5 \
+  --policy.optimizer_grad_clip_norm=1.0 \
+  --policy.scheduler_warmup_steps=12500 \
+  --policy.scheduler_decay_steps=250000 \
+  --policy.scheduler_decay_lr=0 \
+  --dataset.repo_id=robocasa365/pretrain_human \
+  --dataset.root="$repo_root/projects/new_project/data/pretrain_human" \
   --dataset.eval_split=0 \
   --dataset.video_backend=torchcodec \
-  --batch_size=64 \
-  --num_workers=16 \
-  --steps=100000 \
-  --save_freq=10000 \
+  --batch_size=48 \
+  --num_workers=24 \
+  --steps=250000 \
+  --log_freq=200 \
+  --save_freq=12500 \
   --env_eval_freq=0 \
-  --seed=1000 \
-  --output_dir=outputs/robocasa_bc_100k \
-  --job_name=robocasa_bc_100k \
+  --seed=42 \
+  --output_dir=outputs/smolvla024b_robocasa365_human300_bsz192_steps250k_ck16_gpu4 \
+  --job_name=smolvla024b_robocasa365_human300_bsz192_steps250k_ck16_gpu4 \
   --wandb.enable=true \
   --wandb.project=robocasa_bc \
   --wandb.mode=online \

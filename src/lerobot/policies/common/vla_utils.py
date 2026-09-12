@@ -57,6 +57,10 @@ def create_sinusoidal_pos_embedding(  # see openpi `create_sinusoidal_pos_embedd
     return torch.cat([torch.sin(sin_input), torch.cos(sin_input)], dim=-1)
 
 
+# Keep this tiny mask helper out of torch.compile graphs. TorchInductor can fuse
+# the cumsum/comparison pattern below into a Triton split-scan kernel that crashes
+# on affected CUDA/PyTorch combinations. The surrounding SmolVLA graph still compiles.
+@torch.compiler.disable
 def make_att_2d_masks(pad_masks: Tensor, att_masks: Tensor) -> Tensor:  # see openpi (exact copy)
     """Copied from big_vision.
 
