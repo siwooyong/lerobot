@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from lerobot.types import (
+from lerobot.lerobot_types import (
     EnvAction,
     EnvTransition,
     PolicyAction,
@@ -97,14 +97,8 @@ from .relative_action_processor import (
     to_relative_actions,
 )
 from .rename_processor import RenameObservationsProcessorStep, rename_stats
+from .render_messages_processor import RenderRuntimeMessagesStep, RenderTrainingMessagesStep
 from .tokenizer_processor import ActionTokenizerProcessorStep, TokenizerProcessorStep
-
-# RenderMessagesStep is intentionally NOT re-exported here: it pulls in
-# `lerobot.datasets.language`, which requires the `[dataset]` extra
-# (`datasets`, `pyarrow`). Importing it from the processor package would
-# break every base-install consumer of `lerobot.processor`. Users that
-# need it import directly:
-#   from lerobot.processor.render_messages_processor import RenderMessagesStep
 
 __all__ = [
     "ActionProcessorStep",
@@ -160,6 +154,8 @@ __all__ = [
     "RobotObservation",
     "rename_stats",
     "RenameObservationsProcessorStep",
+    "RenderRuntimeMessagesStep",
+    "RenderTrainingMessagesStep",
     "RewardClassifierProcessorStep",
     "RewardProcessorStep",
     "DataProcessorPipeline",
