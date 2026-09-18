@@ -184,6 +184,9 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
             f"{pformat(dataset.repo_id_to_index, indent=2)}"
         )
 
+    if dataset.meta.stats == {}:
+        raise ValueError("stats.json is {}")
+
     if cfg.dataset.use_imagenet_stats:
         for key in dataset.meta.camera_keys:
             if key in dataset.meta.depth_keys:

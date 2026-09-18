@@ -229,6 +229,7 @@ class RoboCasaEnv(gym.Env):
             camera_heights=self.observation_height,
             split=self.split if self.split is not None else "all",
             obj_registries=self.obj_registries,
+            renderer="mujoco",
         )
 
         ep_meta = self._env.env.get_ep_meta()
