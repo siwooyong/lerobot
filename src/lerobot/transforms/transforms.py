@@ -673,10 +673,15 @@ class ImageTransformsConfig:
                 type="SharpnessJitter",
                 kwargs={"sharpness": (0.5, 1.5)},
             ),
-            "affine": ImageTransformConfig(
+            "crop": ImageTransformConfig(
                 weight=1.0,
-                type="RandomAffine",
-                kwargs={"degrees": (-5.0, 5.0), "translate": (0.05, 0.05)},
+                type="RandomResizedCrop",
+                kwargs={"size": (256, 256), "scale": (0.95, 1.0), "ratio": (1.0, 1.0)},
+            ),
+            "rotate": ImageTransformConfig(
+                weight=1.0,
+                type="RandomRotation",
+                kwargs={"degrees": (-3.0, 3.0)},
             ),
         }
     )

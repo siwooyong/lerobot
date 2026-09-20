@@ -38,6 +38,9 @@ accelerate launch \
   --dataset.root="$repo_root/projects/new_project/data/pretrain_human" \
   --dataset.eval_split=0 \
   --dataset.video_backend=torchcodec \
+  --dataset.image_transforms.enable=true \
+  --dataset.image_transforms.max_num_transforms=3 \
+  --dataset.image_transforms.random_order=true \
   --batch_size=48 \
   --num_workers=16 \
   --steps=250000 \
@@ -45,8 +48,8 @@ accelerate launch \
   --save_freq=10000 \
   --env_eval_freq=0 \
   --seed=42 \
-  --output_dir=outputs/smolvla045b_robocasa365_human300_quantiles_bsz192_steps250k_ck16_gpu4 \
-  --job_name=smolvla045b_robocasa365_human300_quantiles_bsz192_steps250k_ck16_gpu4 \
+  --output_dir=outputs/smolvla045b_robocasa365_human300_quantiles_prtsaug_bsz192_steps250k_ck16_gpu4 \
+  --job_name=smolvla045b_robocasa365_human300_quantiles_prtsaug_bsz192_steps250k_ck16_gpu4 \
   --wandb.enable=true \
   --wandb.project=robocasa_bc \
   --wandb.mode=online \
