@@ -545,11 +545,8 @@ def eval_policy(
         # LIBERO assigns one fixed initial-state index to each worker. Reassert the
         # index for every evaluation batch so vector-env auto-resets cannot shift
         # the next batch away from the intended contiguous evaluation states.
-        try:
-            env.get_attr("init_state_id")
-        except (AttributeError, NotImplementedError):
-            pass
-        else:
+        # Query existence safely: get_attr on a missing attribute terminates async workers.
+        if all(env.call("has_wrapper_attr", "init_state_id")):
             start_index = batch_ix * env.num_envs
             env.set_attr("init_state_id", list(range(start_index, start_index + env.num_envs)))
 

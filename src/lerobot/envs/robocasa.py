@@ -266,12 +266,9 @@ class RoboCasaEnv(gym.Env):
         self._ensure_env()
         assert self._env is not None
         super().reset(seed=seed)
-        # Spread the seed across workers so n_envs factories don't all
-        # roll the same scene. With an explicit user seed we shift it by
-        # episode_index; with no seed we fall back to episode_index so
-        # each worker is still distinct rather than inheriting the same
-        # global RNG state.
-        worker_seed = seed + self.episode_index if seed is not None else self.episode_index
+        # The evaluator already assigns a distinct seed to each worker.
+        # Preserve it; use the worker index only when no seed is provided.
+        worker_seed = seed if seed is not None else self.episode_index
         raw_obs, info = self._env.reset(seed=worker_seed)
 
         ep_meta = self._env.env.get_ep_meta()
