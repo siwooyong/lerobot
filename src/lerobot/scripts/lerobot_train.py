@@ -61,6 +61,13 @@ from lerobot.common.wandb_utils import WandBLogger
 from lerobot.configs import JobConfig, parser
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.datasets import EpisodeAwareSampler, compute_sampler_state
+from lerobot.datasets.episode_sequence import (
+    SEQUENCE_IS_PAD,
+    EpisodeSequenceDataset,
+    TaskEpisodeSampler,
+    collate_episode_sequences,
+    flatten_episode_sequence_batch,
+)
 from lerobot.datasets.factory import make_train_eval_datasets
 from lerobot.distributed import (
     ParallelDims,
@@ -97,6 +104,7 @@ else:
 from .lerobot_eval import eval_policy_all
 
 EMA_STATE_FILENAME = "ema_state.pt"
+SAMPLES_STATE_FILENAME = "samples.txt"
 
 
 @contextmanager
@@ -132,11 +140,17 @@ def _preprocess_dataset_batch(
     preprocessor: Any,
 ) -> Any:
     """Prepare a raw dataset batch identically for training and held-out evaluation."""
+    sequence_mask = None
+    if SEQUENCE_IS_PAD in batch:
+        batch, sequence_mask = flatten_episode_sequence_batch(batch)
     for cam_key in camera_keys:
         if cam_key in batch and batch[cam_key].dtype == torch.uint8:
             batch[cam_key] = batch[cam_key].to(dtype=torch.float32) / 255.0
     batch = rename_batch_keys(batch, rename_map)
-    return preprocessor(batch)
+    batch = preprocessor(batch)
+    if sequence_mask is not None:
+        batch[SEQUENCE_IS_PAD] = sequence_mask
+    return batch
 
 
 def update_policy(
@@ -283,22 +297,35 @@ def make_dataloaders(
         dataloader and the eval dataloader (None when no eval split exists).
     """
     active_cfg = cfg.trainable_config
+    sequence_policy = getattr(active_cfg, "type", None) == "smolvla_memory"
+    if sequence_policy:
+        if cfg.dataset.streaming:
+            raise ValueError("smolvla_memory training requires a map-style episode dataset")
+        if cfg.sample_weighting is not None:
+            raise ValueError("Sample weighting is not supported for smolvla_memory sequence training")
+        dataset = EpisodeSequenceDataset(dataset, active_cfg.sequence_length, active_cfg.n_action_steps)
+        if eval_dataset is not None:
+            eval_dataset = EpisodeSequenceDataset(
+                eval_dataset, active_cfg.sequence_length, active_cfg.n_action_steps
+            )
     if not cfg.dataset.streaming:
-        # All non-streaming (map-style) datasets use EpisodeAwareSampler.
-        # The order is a pure function of (seed, epoch), so every rank independently produces the
-        # same permutation. accelerate then shards it disjointly across data-parallel ranks via
-        # BatchSamplerShard without needing a `generator` attribute to synchronize an RNG, and
-        # resume is sample-exact.
+        # Seeded samplers reproduce the same global stream on every rank;
+        # accelerate shards sample positions and the sampler supports resume.
         shuffle = False
-        sampler = EpisodeAwareSampler(
-            dataset.meta.episodes["dataset_from_index"],
-            dataset.meta.episodes["dataset_to_index"],
-            episode_indices_to_use=dataset.episodes,
-            drop_n_last_frames=getattr(active_cfg, "drop_n_last_frames", 0),
-            shuffle=True,
-            seed=cfg.seed if cfg.seed is not None else 0,
-            absolute_to_relative_idx=dataset.absolute_to_relative_idx,
-        )
+        if sequence_policy:
+            sampler = TaskEpisodeSampler(
+                dataset, active_cfg.chunk_size, seed=cfg.seed if cfg.seed is not None else 0
+            )
+        else:
+            sampler = EpisodeAwareSampler(
+                dataset.meta.episodes["dataset_from_index"],
+                dataset.meta.episodes["dataset_to_index"],
+                episode_indices_to_use=dataset.episodes,
+                drop_n_last_frames=getattr(active_cfg, "drop_n_last_frames", 0),
+                shuffle=True,
+                seed=cfg.seed if cfg.seed is not None else 0,
+                absolute_to_relative_idx=dataset.absolute_to_relative_idx,
+            )
         if cfg.resume and step > 0:
             # The resume offset depends on the (dp_world_size, batch_size) that produced `step`,
             # so use the values recorded in the checkpoint (falling back to the current ones for
@@ -336,7 +363,11 @@ def make_dataloaders(
     # Only swap in the language-aware collate when the dataset actually
     # declares language columns; otherwise stay on PyTorch's default
     # collate so non-language training runs are unaffected.
-    collate_fn = lerobot_collate_fn if dataset.meta.has_language_columns else None
+    collate_fn = (
+        collate_episode_sequences
+        if sequence_policy
+        else lerobot_collate_fn if dataset.meta.has_language_columns else None
+    )
     dataloader = torch.utils.data.DataLoader(
         dataset,
         num_workers=cfg.num_workers,
@@ -365,7 +396,7 @@ def make_dataloaders(
                 selected.extend(frames.tolist())
             eval_ds = torch.utils.data.Subset(eval_dataset, selected)
 
-        eval_collate_fn = lerobot_collate_fn if dataset.meta.has_language_columns else None
+        eval_collate_fn = collate_fn
         eval_dataloader = torch.utils.data.DataLoader(
             eval_ds,
             batch_size=cfg.batch_size,
@@ -710,14 +741,30 @@ def train(cfg: TrainPipelineConfig):
         # max() because headroom is gated by the worst-case rank.
         train_metrics["gpu_mem_gb"] = AverageMeter("mem_gb", ":.2f", reduction="max")
 
+    sequence_length = (
+        active_cfg.sequence_length if getattr(active_cfg, "type", None) == "smolvla_memory" else 1
+    )
+    initial_samples = None
+    if cfg.resume:
+        samples_path = cfg.checkpoint_path / TRAINING_STATE_DIR / SAMPLES_STATE_FILENAME
+        if samples_path.exists():
+            initial_samples = int(samples_path.read_text())
+        elif sequence_length > 1 and is_main_process():
+            logging.warning(
+                "Checkpoint has no frame counter; past samples are estimated as step * batch * "
+                "sequence_length * dp_world_size without excluding padding."
+            )
+
     train_tracker = MetricsTracker(
-        cfg.batch_size,
+        cfg.batch_size * sequence_length,
         dataset.num_frames,
         dataset.num_episodes,
         train_metrics,
         initial_step=step,
         dp_world_size=parallel_dims.dp_world_size,
+        initial_samples=initial_samples,
     )
+    samples_at_last_log = train_tracker.samples
 
     if is_main_process():
         progbar = tqdm(
@@ -737,6 +784,7 @@ def train(cfg: TrainPipelineConfig):
         batch = next(dl_iter)
         preprocessing_start = time.perf_counter()
         train_tracker.dataloading_s = preprocessing_start - step_start
+        frame_count = (~batch[SEQUENCE_IS_PAD]).sum() if SEQUENCE_IS_PAD in batch else None
         batch = _preprocess_dataset_batch(batch, dataset.meta.camera_keys, cfg.rename_map, preprocessor)
         train_tracker.preprocessing_s = time.perf_counter() - preprocessing_start
 
@@ -763,7 +811,12 @@ def train(cfg: TrainPipelineConfig):
         step += 1
         if is_main_process():
             progbar.update(1)
-        train_tracker.step()
+        num_samples = None
+        if frame_count is not None:
+            if accelerator.num_processes > 1:
+                frame_count = accelerator.reduce(frame_count.to(device), reduction="sum")
+            num_samples = int(frame_count.item()) // parallel_dims.cp_size
+        train_tracker.step(num_samples)
         is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0
         is_saving_step = should_save_checkpoint(step, cfg.save_freq, cfg.steps)
         is_env_eval_step = cfg.env_eval_freq > 0 and step % cfg.env_eval_freq == 0
@@ -774,7 +827,9 @@ def train(cfg: TrainPipelineConfig):
             train_tracker.reduce_across_ranks()
             if is_main_process():
                 if train_tracker.step_s.avg > 0:
-                    train_tracker.samples_per_s = samples_per_step / train_tracker.step_s.avg
+                    train_tracker.samples_per_s = (
+                        train_tracker.samples - samples_at_last_log
+                    ) / train_tracker.step_s.sum
                 logging.info(train_tracker)
                 if wandb_logger:
                     # Policy sub-losses (latent_loss, action_loss, ...) are aggregated into the
@@ -789,6 +844,7 @@ def train(cfg: TrainPipelineConfig):
                         wandb_log_dict["ema/decay"] = ema.cur_decay_value
                         wandb_log_dict["ema/step"] = ema.optimization_step
                     wandb_logger.log_dict(wandb_log_dict, step)
+            samples_at_last_log = train_tracker.samples
             train_tracker.reset_averages()
 
         if is_eval_step:
@@ -831,6 +887,9 @@ def train(cfg: TrainPipelineConfig):
                 accelerator=accelerator,
             )
             if is_main_process():
+                (checkpoint_dir / TRAINING_STATE_DIR / SAMPLES_STATE_FILENAME).write_text(
+                    str(train_tracker.samples)
+                )
                 if ema is not None:
                     # Save the shadow for exact resume, plus a directly loadable copy of the EMA
                     # weights (lerobot-eval --policy.path=<checkpoint>/pretrained_model_ema).

@@ -71,7 +71,7 @@ class MetricsTracker:
 
     Args:
         batch_size (int): Per-process batch size (samples per micro-batch on each
-            data-parallel worker).
+            data-parallel worker), or nominal frame count for sequence training.
         num_frames (int): Total number of frames in the training dataset.
         num_episodes (int): Total number of episodes in the training dataset.
         metrics (dict[str, AverageMeter]): The meters to track, keyed by metric name.
@@ -80,6 +80,8 @@ class MetricsTracker:
         dp_world_size (int): Number of distinct data-parallel workers
             (`dp_replicate * dp_shard`), used to scale sample accounting; context-parallel
             peers consume the same batch and must not be double counted. Defaults to 1.
+        initial_samples (int | None): Saved global sample count when resuming. If absent,
+            estimate it from initial_step, batch_size and dp_world_size.
 
     Usage pattern:
 
@@ -134,6 +136,7 @@ class MetricsTracker:
         metrics: dict[str, AverageMeter],
         initial_step: int = 0,
         dp_world_size: int = 1,
+        initial_samples: int | None = None,
     ):
         self.__dict__.update(dict.fromkeys(self.__keys__))
         self._batch_size = batch_size
@@ -147,9 +150,12 @@ class MetricsTracker:
         self.metrics = metrics
 
         self.steps = initial_step
-        # A sample is an (observation,action) pair, where observation and action
-        # can be on multiple timestamps. In a batch, we have `batch_size` number of samples.
-        self.samples = self.steps * self._batch_size * self._dp_world_size
+        # Sequence training counts valid observation frames, including repeated draws.
+        self.samples = (
+            self.steps * self._batch_size * self._dp_world_size
+            if initial_samples is None
+            else initial_samples
+        )
         self.episodes = self.samples / self._avg_samples_per_ep
         self.epochs = self.samples / self._num_frames
         # Meter names the caller registered up front. update_metrics() leaves these untouched, so a
@@ -172,12 +178,12 @@ class MetricsTracker:
         else:
             raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{name}'")
 
-    def step(self) -> None:
+    def step(self, num_samples: int | None = None) -> None:
         """
-        Updates metrics that depend on 'step' for one step.
+        Update one step, optionally using the actual global sample count for this batch.
         """
         self.steps += 1
-        self.samples += self._batch_size * self._dp_world_size
+        self.samples += self._batch_size * self._dp_world_size if num_samples is None else num_samples
         self.episodes = self.samples / self._avg_samples_per_ep
         self.epochs = self.samples / self._num_frames
 
