@@ -30,10 +30,12 @@ torchrun --nproc-per-node=8 $(which lerobot-train) \
 
 import dataclasses
 import logging
+import shutil
 import sys
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
+from pathlib import Path
 from pprint import pformat
 from typing import TYPE_CHECKING, Any
 
@@ -84,7 +86,12 @@ from lerobot.policies.factory import ProcessorConfigKwargs
 from lerobot.processor.rename_processor import rename_batch_keys, rename_stats
 from lerobot.rewards import make_reward_pre_post_processors
 from lerobot.utils.collate import lerobot_collate_fn
-from lerobot.utils.constants import PRETRAINED_MODEL_DIR, TRAINING_STATE_DIR
+from lerobot.utils.constants import (
+    CHECKPOINTS_DIR,
+    LAST_CHECKPOINT_LINK,
+    PRETRAINED_MODEL_DIR,
+    TRAINING_STATE_DIR,
+)
 from lerobot.utils.import_utils import _peft_available, register_third_party_plugins, require_package
 from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
 from lerobot.utils.random_utils import set_seed
@@ -105,6 +112,25 @@ from .lerobot_eval import eval_policy_all
 
 EMA_STATE_FILENAME = "ema_state.pt"
 SAMPLES_STATE_FILENAME = "samples.txt"
+
+
+def _remove_local_checkpoint(checkpoint_dir: Path, output_dir: Path) -> None:
+    """Remove one staged checkpoint, restricting deletion to this run's step directories."""
+    checkpoints_dir = (output_dir / CHECKPOINTS_DIR).resolve()
+    resolved_checkpoint_dir = checkpoint_dir.resolve()
+    if (
+        checkpoint_dir.is_symlink()
+        or resolved_checkpoint_dir.parent != checkpoints_dir
+        or not checkpoint_dir.name.isdigit()
+    ):
+        raise ValueError(
+            f"Refusing to delete a checkpoint outside this run's step directories: {checkpoint_dir}"
+        )
+    last_checkpoint = checkpoints_dir / LAST_CHECKPOINT_LINK
+    if last_checkpoint.is_symlink() and last_checkpoint.resolve() == resolved_checkpoint_dir:
+        last_checkpoint.unlink()
+    shutil.rmtree(resolved_checkpoint_dir)
+    logging.info("Removed local checkpoint %s", checkpoint_dir)
 
 
 @contextmanager
@@ -436,6 +462,8 @@ def train(cfg: TrainPipelineConfig):
 
     require_package("accelerate", extra="training")
 
+    resume_source = parser.parse_arg("config_path") if cfg.resume else None
+    resume_from_hub = resume_source is not None and not Path(resume_source).resolve().exists()
     cfg.validate()  # all fail-fasts fire here, before any distributed init
 
     # --- engine & topology --------------------------------------------------------------------
@@ -766,6 +794,13 @@ def train(cfg: TrainPipelineConfig):
     )
     samples_at_last_log = train_tracker.samples
 
+    if resume_from_hub and not cfg.keep_local_checkpoints:
+        # Every rank has restored model/optimizer/RNG, sampler, EMA and the sample counter.
+        accelerator.wait_for_everyone()
+        if is_main_process():
+            _remove_local_checkpoint(cfg.checkpoint_path, cfg.output_dir)
+        accelerator.wait_for_everyone()
+
     if is_main_process():
         progbar = tqdm(
             total=cfg.steps - step,
@@ -901,7 +936,8 @@ def train(cfg: TrainPipelineConfig):
                         cfg.save_pretrained(ema_dir)
                         preprocessor.save_pretrained(ema_dir)
                         postprocessor.save_pretrained(ema_dir)
-                update_last_checkpoint(checkpoint_dir)
+                if cfg.keep_local_checkpoints:
+                    update_last_checkpoint(checkpoint_dir)
                 if cfg.save_checkpoint_to_hub:
                     push_checkpoint_to_hub(
                         checkpoint_dir,
@@ -910,6 +946,9 @@ def train(cfg: TrainPipelineConfig):
                     )
                 if wandb_logger:
                     wandb_logger.log_policy(checkpoint_dir)
+                if not cfg.keep_local_checkpoints:
+                    # Only reached after the upload and its completion tag both succeed.
+                    _remove_local_checkpoint(checkpoint_dir, cfg.output_dir)
             accelerator.wait_for_everyone()
 
         if cfg.env and is_env_eval_step:

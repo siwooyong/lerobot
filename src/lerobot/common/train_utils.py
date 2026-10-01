@@ -539,18 +539,19 @@ def push_checkpoint_to_hub(
     )
 
 
-def resolve_resume_checkpoint(repo_id: str, output_dir: Path) -> Path:
+def resolve_resume_checkpoint(repo_id: str, output_dir: Path, *, create_last_link: bool = True) -> Path:
     """Download the latest checkpoint of a Hub training repo into a local run dir.
 
     The symmetric counterpart to `push_checkpoint_to_hub`: given a model repo holding
     `checkpoints/<step>/{pretrained_model,training_state}` subtrees, download the highest-numbered step
-    into `output_dir/checkpoints/<step>/`, recreate the local `last` symlink, and return that local
+    into `output_dir/checkpoints/<step>/`, optionally recreate the local `last` symlink, and return that local
     checkpoint dir. Used to resume training from the Hub on a machine (or HF Jobs pod) that does not
     have the original local run dir.
 
     Args:
         repo_id (str): The Hub model repo holding `checkpoints/<step>/` subtrees.
         output_dir (Path): The local run directory to download the checkpoint into.
+        create_last_link (bool): Whether to create the local `last` symlink. Defaults to True.
 
     Returns:
         Path: The local checkpoint step directory, `output_dir/checkpoints/<step>`.
@@ -571,7 +572,8 @@ def resolve_resume_checkpoint(repo_id: str, output_dir: Path) -> Path:
         local_dir=str(output_dir),
     )
     checkpoint_dir = output_dir / latest
-    update_last_checkpoint(checkpoint_dir)
+    if create_last_link:
+        update_last_checkpoint(checkpoint_dir)
     return checkpoint_dir
 
 

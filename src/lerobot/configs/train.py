@@ -174,6 +174,9 @@ class TrainPipelineConfig(HubMixin):
     # just the final model (useful to monitor progress mid-run). Optional; the
     # final model is pushed regardless. Works the same locally and remotely.
     save_checkpoint_to_hub: bool = False
+    # Keep local checkpoint files after a successful Hub upload. False uses the
+    # local checkpoint directory only as temporary staging; failed uploads are retained.
+    keep_local_checkpoints: bool = True
 
     # Sample weighting configuration (e.g., for RA-BC training)
     sample_weighting: SampleWeightingConfig | None = None
@@ -255,7 +258,9 @@ class TrainPipelineConfig(HubMixin):
             else:
                 now = dt.datetime.now()
                 self.output_dir = Path("outputs/train") / f"{now:%Y-%m-%d}/{now:%H-%M-%S}_resume"
-            self.checkpoint_path = resolve_resume_checkpoint(config_path, self.output_dir)
+            self.checkpoint_path = resolve_resume_checkpoint(
+                config_path, self.output_dir, create_last_link=self.keep_local_checkpoints
+            )
             policy_dir = self.checkpoint_path / PRETRAINED_MODEL_DIR
 
         if self.policy is not None:
@@ -330,6 +335,18 @@ class TrainPipelineConfig(HubMixin):
 
         if self.save_checkpoint_to_hub and not (self.policy is not None and self.policy.repo_id):
             raise ValueError("save_checkpoint_to_hub requires --policy.repo_id.")
+
+        if not self.keep_local_checkpoints:
+            if not self.save_checkpoint or not self.save_checkpoint_to_hub:
+                raise ValueError(
+                    "--keep_local_checkpoints=false requires --save_checkpoint=true "
+                    "and --save_checkpoint_to_hub=true."
+                )
+            if self.wandb.enable and not self.wandb.disable_artifact:
+                raise ValueError(
+                    "--keep_local_checkpoints=false requires --wandb.disable_artifact=true "
+                    "so WandB does not read checkpoint files after they are deleted."
+                )
 
         self._validate_distributed()
 

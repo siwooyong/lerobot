@@ -37,8 +37,9 @@ def find_latest_hub_checkpoint(
     """Repo-relative path of the most recent checkpoint in a training repo.
 
     Training runs push checkpoints to ``checkpoints/<step>/`` (see
-    ``push_checkpoint_to_hub``). This lists those step dirs and returns
-    ``checkpoints/<highest-step>``, or ``None`` if the repo has no checkpoints.
+    ``push_checkpoint_to_hub``). Only step directories with a matching completion tag
+    are considered, excluding interrupted uploads. Returns ``checkpoints/<highest-step>``,
+    or ``None`` if the repo has no completed checkpoints.
 
     Args:
         repo_id (str): The Hub model repo to inspect.
@@ -48,13 +49,18 @@ def find_latest_hub_checkpoint(
 
     Returns:
         str | None: The repo-relative path `checkpoints/<highest-step>`, or None if the repo
-            has no checkpoints.
+            has no completed checkpoints.
     """
-    files = HfApi().list_repo_files(repo_id=repo_id, repo_type="model", revision=revision, token=token)
+    api = HfApi()
+    files = api.list_repo_files(repo_id=repo_id, repo_type="model", revision=revision, token=token)
     prefix = f"{CHECKPOINTS_DIR}/"
     steps = {
         name for f in files if f.startswith(prefix) and (name := f[len(prefix) :].split("/", 1)[0]).isdigit()
     }
+    if not steps:
+        return None
+    refs = api.list_repo_refs(repo_id=repo_id, repo_type="model", token=token)
+    steps.intersection_update(tag.name for tag in refs.tags if tag.name.isdigit())
     if not steps:
         return None
     return f"{CHECKPOINTS_DIR}/{max(steps, key=int)}"

@@ -418,7 +418,8 @@ class Qwen3Backbone(nn.Module):
         Older Transformers releases exposed this tensor as ``hidden_states[-1]``.
         Newer releases expose the post-final-norm tensor there instead. Capturing
         the last decoder layer output directly keeps the N1.7 action head input
-        stable across Transformers versions.
+        stable across Transformers versions. Calling the base multimodal model
+        skips the unused LM logits while preserving the checkpoint module tree.
         """
 
         captured: dict[str, torch.Tensor] = {}
@@ -433,11 +434,18 @@ class Qwen3Backbone(nn.Module):
 
         hook = self.language_model.layers[-1].register_forward_hook(capture_output)
         try:
-            outputs = self.model(**model_input, output_hidden_states=True)
+            self.model.model(
+                **model_input,
+                use_cache=False,
+                output_hidden_states=False,
+                return_dict=True,
+            )
         finally:
             hook.remove()
 
-        return captured.get("features", outputs.hidden_states[-1])
+        if "features" not in captured:
+            raise RuntimeError("Failed to capture the pre-final-norm output of the last Qwen3-VL decoder layer.")
+        return captured["features"]
 
     def forward(self, vl_input: BatchFeature) -> BatchFeature:
         self.set_frozen_modules_to_eval_mode()

@@ -121,6 +121,30 @@ N1_7_EMBODIMENT_MAPPING = {
 }
 
 
+def _dataset_stats_with_quantile_bounds(
+    dataset_stats: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Use dataset q01/q99 as GR00T's bounds, retaining min/max for constant quantiles."""
+    normalized_stats = dict(dataset_stats)
+    for key in (OBS_STATE, ACTION):
+        stats = dataset_stats.get(key)
+        if not isinstance(stats, dict) or not all(
+            name in stats for name in ("q01", "q99", "min", "max")
+        ):
+            raise ValueError(f"GR00T new_embodiment requires dataset min/max and q01/q99 for '{key}'.")
+        q01, q99 = torch.as_tensor(stats["q01"]), torch.as_tensor(stats["q99"])
+        minimum, maximum = torch.as_tensor(stats["min"]), torch.as_tensor(stats["max"])
+        if not (q01.shape == q99.shape == minimum.shape == maximum.shape):
+            raise ValueError(f"GR00T dataset statistics for '{key}' have inconsistent shapes.")
+        use_quantiles = q99 > q01
+        normalized_stats[key] = {
+            **stats,
+            "min": torch.where(use_quantiles, q01, minimum),
+            "max": torch.where(use_quantiles, q99, maximum),
+        }
+    return normalized_stats
+
+
 @dataclass
 class _GrootN17CheckpointProcessorAssets:
     """Processor metadata loaded from a raw Isaac-GR00T N1.7 checkpoint.
@@ -199,7 +223,8 @@ def _load_n1_7_checkpoint_processor_assets(config: GrootConfig) -> _GrootN17Chec
         modality_config=modality_config,
         use_relative_action=use_relative_action,
     )
-    embodiment_mapping = _load_n1_7_embodiment_mapping(checkpoint_path) or dict(N1_7_EMBODIMENT_MAPPING)
+    embodiment_mapping = dict(N1_7_EMBODIMENT_MAPPING)
+    embodiment_mapping.update(_load_n1_7_embodiment_mapping(checkpoint_path) or {})
     formalize_language = processor_kwargs.get("formalize_language", True)
     if not isinstance(formalize_language, bool):
         formalize_language = True
@@ -1166,7 +1191,12 @@ def make_groot_pre_post_processors(
     dataset_meta = dataset_meta or getattr(config, "_runtime_dataset_meta", None)
     checkpoint_assets = _load_n1_7_checkpoint_processor_assets(config)
     checkpoint_stats = checkpoint_assets.stats if checkpoint_assets is not None else None
-    checkpoint_has_stats = has_modality_stats(checkpoint_stats)
+    use_dataset_quantiles = (
+        config.embodiment_tag == "new_embodiment"
+        and dataset_stats is not None
+        and not config.use_relative_actions
+    )
+    checkpoint_has_stats = has_modality_stats(checkpoint_stats) and not use_dataset_quantiles
     if config.use_relative_actions and not checkpoint_has_stats:
         relative_dataset_stats = dataset_stats
         if not _stats_preserve_action_horizon(relative_dataset_stats):
@@ -1198,14 +1228,21 @@ def make_groot_pre_post_processors(
         if checkpoint_assets is not None and checkpoint_assets.valid_action_horizon is not None
         else action_horizon
     )
-    padded_stats = checkpoint_stats if checkpoint_has_stats else (dataset_stats or {})
+    if use_dataset_quantiles:
+        padded_stats = _dataset_stats_with_quantile_bounds(dataset_stats)
+    else:
+        padded_stats = checkpoint_stats if checkpoint_has_stats else (dataset_stats or {})
     embodiment_mapping = (
         checkpoint_assets.embodiment_mapping
         if checkpoint_assets is not None
         else dict(N1_7_EMBODIMENT_MAPPING)
     )
     formalize_language = checkpoint_assets.formalize_language if checkpoint_assets is not None else True
-    clip_outliers = checkpoint_assets.clip_outliers if checkpoint_assets is not None else True
+    clip_outliers = (
+        True
+        if use_dataset_quantiles or checkpoint_assets is None
+        else checkpoint_assets.clip_outliers
+    )
     video_modality_keys = checkpoint_assets.video_modality_keys if checkpoint_assets is not None else None
     try:
         env_action_dim = int(config.output_features[ACTION].shape[0])
@@ -1228,9 +1265,19 @@ def make_groot_pre_post_processors(
         stats=padded_stats,
         clip_outliers=clip_outliers,
         video_modality_keys=video_modality_keys,
-        raw_stats=checkpoint_assets.raw_stats if checkpoint_assets is not None else None,
-        use_percentiles=checkpoint_assets.use_percentiles if checkpoint_assets is not None else False,
-        modality_config=checkpoint_assets.modality_config if checkpoint_assets is not None else None,
+        raw_stats=(
+            checkpoint_assets.raw_stats if checkpoint_assets is not None and not use_dataset_quantiles else None
+        ),
+        use_percentiles=(
+            checkpoint_assets.use_percentiles
+            if checkpoint_assets is not None and not use_dataset_quantiles
+            else False
+        ),
+        modality_config=(
+            checkpoint_assets.modality_config
+            if checkpoint_assets is not None and not use_dataset_quantiles
+            else None
+        ),
     )
 
     # Resolve the image preprocessing geometry. Honor the checkpoint's processor_config
@@ -1342,18 +1389,20 @@ def make_groot_pre_post_processors(
 # GR00T specific processor steps
 
 
-def _to_uint8_np_bthwc(img_t: torch.Tensor) -> np.ndarray:
+def _to_uint8_bthwc(img_t: torch.Tensor) -> torch.Tensor:
     # img_t: (B, C, H, W) or (B, T, C, H, W), float in [0,1] or uint8
     if img_t.dtype.is_floating_point:
         img_t = (img_t.clamp(0, 1) * 255.0).to(torch.uint8)
     if img_t.dim() == 4:
-        return rearrange(img_t.cpu().numpy(), "b c h w -> b 1 h w c")
+        return rearrange(img_t, "b c h w -> b 1 h w c")
     if img_t.dim() == 5:
-        return rearrange(img_t.cpu().numpy(), "b t c h w -> b t h w c")
+        return rearrange(img_t, "b t c h w -> b t h w c")
     raise ValueError(f"Expected image tensor shape (B, C, H, W) or (B, T, C, H, W), got {tuple(img_t.shape)}")
 
 
-def _align_video_horizon(video: np.ndarray, horizon: int | None) -> np.ndarray:
+def _align_video_horizon(
+    video: torch.Tensor | np.ndarray, horizon: int | None
+) -> torch.Tensor | np.ndarray:
     """Match the checkpoint video horizon by truncating or left-padding frames."""
 
     if horizon is None or horizon <= 0:
@@ -1363,6 +1412,9 @@ def _align_video_horizon(video: np.ndarray, horizon: int | None) -> np.ndarray:
         return video
     if current > horizon:
         return video[:, -horizon:]
+    if torch.is_tensor(video):
+        pad = video[:, :1].expand(-1, horizon - current, *video.shape[2:])
+        return torch.cat([pad, video], dim=1)
     pad = np.repeat(video[:, :1], horizon - current, axis=1)
     return np.concatenate([pad, video], axis=1)
 
@@ -1852,8 +1904,8 @@ class GrootN17PackInputsStep(ProcessorStep):
 
         img_keys = self._ordered_image_keys(obs)
         if img_keys:
-            cams = [_align_video_horizon(_to_uint8_np_bthwc(obs[k]), self.video_horizon) for k in img_keys]
-            video = np.stack(cams, axis=2)  # (B, T, V, H, W, C)
+            cams = [_align_video_horizon(_to_uint8_bthwc(obs[k]), self.video_horizon) for k in img_keys]
+            video = torch.stack(cams, dim=2)  # (B, T, V, H, W, C), kept on the input device
             obs["video"] = video
             image_keys_to_remove = [key for key in obs if key.startswith(OBS_IMAGES)]
             if OBS_IMAGE in obs:
@@ -2096,7 +2148,7 @@ class GrootN17VLMEncodeStep(ProcessorStep):
         ``target_device`` when set) for the torchvision-backed Qwen processor.
         """
         if self.use_albumentations:
-            video_np = np.asarray(video)
+            video_np = video.detach().cpu().numpy() if torch.is_tensor(video) else np.asarray(video)
             train_crop = self.training and torch.is_grad_enabled()
             sample_images: list[list[Any]] = []
             for batch_idx in range(batch_size):
@@ -2124,8 +2176,9 @@ class GrootN17VLMEncodeStep(ProcessorStep):
         video_t = video if torch.is_tensor(video) else torch.from_numpy(np.ascontiguousarray(video))
         # (B, T, V, H, W, C) uint8 -> (B, T, V, C, H, W)
         video_t = video_t.permute(0, 1, 2, 5, 3, 4).contiguous()
-        if target_device is not None and video_t.device != target_device:
-            video_t = video_t.to(target_device, non_blocking=(target_device.type == "cuda"))
+        image_device = target_device if target_device is not None else torch.device("cpu")
+        if video_t.device != image_device:
+            video_t = video_t.to(image_device, non_blocking=(image_device.type == "cuda"))
 
         frames_per_sample: list[list[Any]] = []
         for batch_idx in range(batch_size):
