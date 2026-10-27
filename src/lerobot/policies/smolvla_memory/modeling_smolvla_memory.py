@@ -248,8 +248,7 @@ class SmolVLAMemoryPolicy(SmolVLAPolicy):
 
     def reset(self):
         super().reset()
-        self._memory_cache = None
-        self._memory_position = 0
+        self._memory_frames = None
 
     def _get_action_chunk(self, batch, noise=None, **kwargs):
         images, img_masks = self.prepare_images(batch)
@@ -257,12 +256,15 @@ class SmolVLAMemoryPolicy(SmolVLAPolicy):
             images, img_masks, batch[OBS_LANGUAGE_TOKENS], batch[OBS_LANGUAGE_ATTENTION_MASK],
             self.prepare_state(batch),
         )
-        if self._memory_cache is not None and self._memory_cache[0][0].shape[0] != frames.shape[0]:
+        if self._memory_frames is not None and self._memory_frames.shape[0] != frames.shape[0]:
             raise ValueError("Streaming environment batch changed; call policy.reset() first.")
-        memory, self._memory_cache = self.model.temporal_memory.step(
-            frames, self._memory_position, self._memory_cache
-        )
-        self._memory_position += 1
+        frames = frames.detach().unsqueeze(1)
+        if self._memory_frames is not None:
+            frames = torch.cat([self._memory_frames, frames], dim=1)
+        self._memory_frames = frames[:, -self.config.sequence_length :]
+        # Recompute the window so memory states cannot retain older observations.
+        memory = self.model.temporal_memory(self._memory_frames)
+        memory = memory[:, -self.config.frame_num_tokens :].contiguous()
         actions = self.model.sample_with_memory(cache, padding, memory, noise)
         actions = actions[:, :, : self.config.action_feature.shape[0]]
         if self.config.adapt_to_pi_aloha:

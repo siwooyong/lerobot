@@ -11,8 +11,8 @@ videos are intentionally excluded. Low-dimensional values are accumulated in
 ``float64`` to avoid catastrophic cancellation in nearly constant dimensions.
 
 Example:
-    python projects/new_project/scripts/compute_stats.py \
-        --dataset-root projects/new_project/data/atomic
+    python projects/robocasa365/scripts/compute_stats.py \
+        --dataset-root projects/robocasa365/data/atomic
 
 The generated file is:
     <dataset-root>/meta/stats.json

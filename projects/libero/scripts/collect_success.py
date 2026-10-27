@@ -30,7 +30,7 @@ from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.random_utils import set_seed
 from lerobot.utils.utils import init_logging
 
-from projects.robot_learning.dataset.success_data import (
+from projects.libero.dataset.success_data import (
     IMAGE_SHAPE,
     SuccessfulEpisodeRecorder,
     collect_task,

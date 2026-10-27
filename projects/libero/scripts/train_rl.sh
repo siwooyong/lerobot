@@ -10,7 +10,7 @@ export OPENBLAS_NUM_THREADS=1
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 export PYTHONPATH="$root/src${PYTHONPATH:+:$PYTHONPATH}"
 
-python -m projects.robot_learning.rl.train \
+python -m projects.libero.rl.train \
   --checkpoint=outputs/baseline_100k/checkpoints/100000/pretrained_model \
   --output=outputs/flow_noise_libero_10 \
   --suites libero_10 \

@@ -40,7 +40,7 @@ torchrun \
   --policy.repo_id="siwooyong021/groot-n17-atomic-checkpoints" \
   --policy.private=false \
   --dataset.repo_id=robocasa365/atomic \
-  --dataset.root="$repo_root/projects/new_project/data/atomic" \
+  --dataset.root="$repo_root/projects/robocasa365/data/atomic" \
   --dataset.eval_split=0 \
   --dataset.video_backend=torchcodec \
   --dataset.image_transforms.enable=false \

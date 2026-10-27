@@ -15,9 +15,9 @@ Usage:
   compute_stats.sh <dataset-root> [additional compute_stats.py args]
 
 Examples:
-  ./projects/new_project/scripts/compute_stats.sh projects/new_project/data/atomic
-  ./projects/new_project/scripts/compute_stats.sh projects/new_project/data/composite
-  ./projects/new_project/scripts/compute_stats.sh projects/new_project/data/pretrain_human
+  ./projects/robocasa365/scripts/compute_stats.sh projects/robocasa365/data/atomic
+  ./projects/robocasa365/scripts/compute_stats.sh projects/robocasa365/data/composite
+  ./projects/robocasa365/scripts/compute_stats.sh projects/robocasa365/data/pretrain_human
 EOF
   exit 2
 fi
@@ -31,6 +31,6 @@ if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
 fi
 echo "[compute_stats] dataset: $dataset_root"
 
-python "$repo_root/projects/new_project/scripts/compute_stats.py" \
+python "$repo_root/projects/robocasa365/scripts/compute_stats.py" \
   --dataset-root "$dataset_root" \
   "$@"

@@ -21,6 +21,9 @@ optimization from the BC checkpoint.
 Tested on Linux with CUDA 12.8 and an RTX 5090. Use your preferred Python
 environment manager.
 
+<details>
+<summary>Install dependencies</summary>
+
 ```bash
 git clone https://github.com/siwooyong/lerobot.git
 cd lerobot
@@ -41,12 +44,17 @@ pip install -e ".[all]"
 pip install lerobot-lancedb
 ```
 
-Optional authentication for Hugging Face access and W&B experiment tracking:
+</details>
+
+<details>
+<summary>Optional authentication for Hugging Face access and W&B experiment tracking</summary>
 
 ```bash
 hf auth login
 wandb login
 ```
+
+</details>
 
 ## Training budget
 
@@ -106,7 +114,8 @@ episode count and denoising configuration are stated with each experiment.
 
 Run commands from the LeRobot repository root after completing setup.
 
-### Behavior cloning
+<details>
+<summary>Convert data and train BC</summary>
 
 ```bash
 lerobot-convert-to-lance \
@@ -114,27 +123,35 @@ lerobot-convert-to-lance \
   --output=outputs/datasets/libero_lance \
   --jpeg-quality=100 \
   --jpeg-subsampling=0
-bash projects/robot_learning/scripts/train_bc.sh
+bash projects/libero/scripts/train_bc.sh
 ```
 
-### Collect successful rollouts
+</details>
+
+<details>
+<summary>Collect and convert successful rollouts</summary>
 
 ```bash
 
-bash projects/robot_learning/scripts/collect_success.sh
+bash projects/libero/scripts/collect_success.sh
 lerobot-convert-to-lance \
   --repo-id=siwooyong/libero-smolvla-success-rollouts \
   --src-root=outputs/datasets/libero_success_rollouts \
   --output=outputs/datasets/libero_success_rollouts_lance
 ```
 
-### Online RL from the BC-100k checkpoint
+</details>
+
+<details>
+<summary>Train and evaluate Flow-Noise PPO from BC-100k</summary>
 
 ```bash
 
-bash projects/robot_learning/scripts/train_rl.sh
-bash projects/robot_learning/scripts/test.sh
+bash projects/libero/scripts/train_rl.sh
+bash projects/libero/scripts/test.sh
 ```
+
+</details>
 
 `train_bc.py` replaces only LeRobot's dataset construction with a local
 Lance-backed loader; model construction, optimization, checkpointing, and
@@ -165,4 +182,4 @@ a separate launcher.
 ## Scope
 
 This is a project within a LeRobot fork, not a standalone robotics framework.
-The implementation and experiment utilities live under `projects/robot_learning`.
+The implementation and experiment utilities live under `projects/libero`.

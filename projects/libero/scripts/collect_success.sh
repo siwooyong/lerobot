@@ -3,7 +3,7 @@ set -euo pipefail
 
 export MUJOCO_GL=egl
 
-python -m projects.robot_learning.scripts.collect_success \
+python -m projects.libero.scripts.collect_success \
   --policy.path=outputs/baseline_100k/checkpoints/100000/pretrained_model \
   --policy.device=cuda \
   --policy.n_action_steps=1 \

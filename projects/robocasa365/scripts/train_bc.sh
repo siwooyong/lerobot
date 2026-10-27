@@ -44,7 +44,7 @@ accelerate launch \
   --policy.scheduler_decay_steps=250000 \
   --policy.scheduler_decay_lr=1e-6 \
   --dataset.repo_id=robocasa365/atomic \
-  --dataset.root="$repo_root/projects/new_project/data/atomic" \
+  --dataset.root="$repo_root/projects/robocasa365/data/atomic" \
   --dataset.eval_split=0 \
   --dataset.video_backend=torchcodec \
   --dataset.image_transforms.enable=true \
